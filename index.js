@@ -1,229 +1,278 @@
-// @amql/resolver-npm — Programmatic npm package management via @npmcli/arborist
+// @amql/resolver-npm — Programmatic npm via @npmcli/arborist
 //
-// This resolver wraps npm's internal Arborist library to provide transactional
-// package operations (install, remove, update) without shelling out to the CLI.
-// All operations respect .npmrc, scoped registries, and workspace configurations.
+// Wraps npm's internal libraries to provide the same operations as the CLI
+// but as function calls. No exec(), no subprocess, no manual config parsing.
+// Arborist handles .npmrc, registries, auth, workspaces — we just pass through.
 
-import { createTag, declare, Fragment } from "@amql/resolver";
+import { createTag, declare } from "@amql/resolver";
 import Arborist from "@npmcli/arborist";
-import { readFileSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
 
 // ── Tags ────────────────────────────────────────────────────────────
 
 const Dependency = createTag({
-  name: "",
   version: "",
+  type: "prod",
+  source: "registry",
   resolved: "",
   integrity: "",
-  type: "prod",       // prod | dev | optional | peer
-  source: "registry", // registry | git | file | workspace
 });
 
 const Workspace = createTag({
-  name: "",
   version: "",
   path: "",
 });
 
 const Script = createTag({
-  name: "",
   command: "",
 });
 
-// ── Arborist Wrapper ────────────────────────────────────────────────
+// ── API Surface ─────────────────────────────────────────────────────
+// Mirrors npm CLI commands. Every option Arborist accepts, we accept.
+// We don't parse .npmrc — Arborist does that from the path we give it.
 
 /**
- * Load .npmrc configuration from the project root.
- * Arborist reads .npmrc automatically when given a path, but we extract
- * registry/auth settings for visibility and annotation.
- */
-function loadNpmConfig(projectRoot) {
-  const npmrcPath = join(projectRoot, ".npmrc");
-  const config = {};
-
-  if (existsSync(npmrcPath)) {
-    const raw = readFileSync(npmrcPath, "utf8");
-    for (const line of raw.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx > 0) {
-        config[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-      }
-    }
-  }
-
-  return config;
-}
-
-/**
- * Create an Arborist instance configured for the given project.
- * Respects .npmrc for registries, auth tokens, and scoped configs.
- */
-function createArborist(projectRoot) {
-  const config = loadNpmConfig(projectRoot);
-
-  const opts = {
-    path: projectRoot,
-  };
-
-  // Pass through registry and scoped registry settings
-  if (config.registry) {
-    opts.registry = config.registry;
-  }
-  for (const [key, val] of Object.entries(config)) {
-    if (key.startsWith("@") && key.endsWith(":registry")) {
-      opts[key] = val;
-    }
-    // Pass auth tokens for scoped registries
-    if (key.includes(":_authToken") || key.includes(":_auth")) {
-      opts[key] = val;
-    }
-  }
-
-  return new Arborist(opts);
-}
-
-/**
- * Install one or more packages. Transactional: if any package fails to
- * resolve, none are written.
+ * Install packages. Equivalent to `npm install <specs>`.
  *
- * @param {string} projectRoot — absolute path to project
+ * Arborist handles .npmrc discovery, registry resolution, auth tokens,
+ * scoped registries, and workspace linking from the given path.
+ *
+ * @param {string} path — project root (Arborist finds .npmrc from here)
  * @param {string[]} specs — package specifiers (e.g., ["lodash@^4", "express"])
- * @param {object} options
- * @param {string} options.type — "prod" | "dev" | "optional" | "peer"
- * @param {boolean} options.dryRun — compute changes without writing
- * @returns {Promise<{added: object[], updated: object[]}>}
+ * @param {object} [options] — passed through to Arborist
+ * @param {string} [options.saveType] — "prod" | "dev" | "optional" | "peer"
+ * @param {boolean} [options.save=true] — update package.json and lockfile
+ * @param {boolean} [options.dryRun=false] — compute without writing
+ * @param {boolean} [options.saveBundle] — add to bundleDependencies
+ * @param {boolean} [options.legacyBundling] — use npm v1/v2 nesting
+ * @param {string[]} [options.omit] — dep types to skip: ["dev", "optional"]
+ * @param {object} [options.arboristOptions] — raw Arborist constructor overrides
+ * @returns {Promise<InstallResult>}
  */
-export async function install(projectRoot, specs, options = {}) {
-  const arb = createArborist(projectRoot);
-  const saveType = options.type || "prod";
+export async function install(path, specs, options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
 
-  // Phase 1: build ideal tree (resolve all dependencies)
-  // If ANY spec fails to resolve, this throws — nothing is written
-  await arb.buildIdealTree({
-    add: specs,
-    saveType,
-  });
+  const buildOpts = { add: specs };
+  if (options.saveType) buildOpts.saveType = options.saveType;
+  if (options.saveBundle) buildOpts.saveBundle = options.saveBundle;
+  if (options.legacyBundling) buildOpts.legacyBundling = options.legacyBundling;
 
-  if (options.dryRun) {
-    return { dryRun: true, idealTree: arb.idealTree };
-  }
+  await arb.buildIdealTree(buildOpts);
 
-  // Phase 2: reify (write package.json, package-lock.json, node_modules)
-  // Atomic: package.json and lockfile are written together
-  await arb.reify({ save: true });
-
-  return {
-    added: specs.map((spec) => {
-      const name = spec.split("@")[0] || spec;
-      const node = arb.idealTree.children.get(name);
-      return {
-        name: node?.name || name,
-        version: node?.version || "unknown",
-        resolved: node?.resolved || "",
-        integrity: node?.integrity || "",
-      };
-    }),
+  const reifyOpts = {
+    save: options.save !== false,
+    dryRun: options.dryRun || false,
   };
+  if (options.omit) reifyOpts.omit = options.omit;
+
+  await arb.reify(reifyOpts);
+
+  return summarize(arb, specs);
 }
 
 /**
- * Remove one or more packages. Transactional.
+ * Remove packages. Equivalent to `npm uninstall <names>`.
  *
- * @param {string} projectRoot
+ * @param {string} path
  * @param {string[]} names — package names to remove
+ * @param {object} [options]
+ * @param {boolean} [options.save=true]
+ * @param {boolean} [options.dryRun=false]
+ * @param {object} [options.arboristOptions]
  * @returns {Promise<{removed: string[]}>}
  */
-export async function remove(projectRoot, names) {
-  const arb = createArborist(projectRoot);
+export async function remove(path, names, options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
 
   await arb.buildIdealTree({ rm: names });
-  await arb.reify({ save: true });
+  await arb.reify({
+    save: options.save !== false,
+    dryRun: options.dryRun || false,
+  });
 
   return { removed: names };
 }
 
 /**
- * Update one or more packages (or all if names is empty).
+ * Update packages. Equivalent to `npm update [names]`.
  *
- * @param {string} projectRoot
- * @param {string[]} names — specific packages to update (empty = all)
+ * @param {string} path
+ * @param {string[]} [names] — specific packages (empty = all)
+ * @param {object} [options]
+ * @param {boolean} [options.save=true]
+ * @param {boolean} [options.dryRun=false]
+ * @param {object} [options.arboristOptions]
  * @returns {Promise<void>}
  */
-export async function update(projectRoot, names = []) {
-  const arb = createArborist(projectRoot);
+export async function update(path, names = [], options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
 
-  const updateOpts = names.length > 0 ? { names } : true;
-  await arb.buildIdealTree({ update: updateOpts });
-  await arb.reify({ save: true });
+  const updateOpt = names.length > 0 ? { names } : true;
+  await arb.buildIdealTree({ update: updateOpt });
+  await arb.reify({
+    save: options.save !== false,
+    dryRun: options.dryRun || false,
+  });
+}
+
+/**
+ * List dependency tree. Equivalent to `npm ls`.
+ *
+ * @param {string} path
+ * @param {object} [options]
+ * @param {boolean} [options.all=false] — include transitive deps
+ * @param {object} [options.arboristOptions]
+ * @returns {Promise<TreeNode>}
+ */
+export async function list(path, options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
+  const tree = await arb.loadActual();
+  return nodeToTree(tree, options.all ? Infinity : 1);
+}
+
+/**
+ * Audit for vulnerabilities. Equivalent to `npm audit`.
+ *
+ * @param {string} path
+ * @param {object} [options]
+ * @param {boolean} [options.fix=false] — apply fixes
+ * @param {object} [options.arboristOptions]
+ * @returns {Promise<AuditResult>}
+ */
+export async function audit(path, options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
+  return arb.audit({ fix: options.fix || false });
+}
+
+/**
+ * Load the virtual tree from lockfile. Equivalent to reading
+ * package-lock.json with full resolution.
+ *
+ * @param {string} path
+ * @param {object} [options]
+ * @param {object} [options.arboristOptions]
+ * @returns {Promise<TreeNode>}
+ */
+export async function loadLockfile(path, options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
+  const tree = await arb.loadVirtual();
+  return nodeToTree(tree, Infinity);
+}
+
+/**
+ * Load the actual tree from node_modules. Reads what's on disk.
+ *
+ * @param {string} path
+ * @param {object} [options]
+ * @param {object} [options.arboristOptions]
+ * @returns {Promise<TreeNode>}
+ */
+export async function loadActual(path, options = {}) {
+  const arb = new Arborist({ path, ...options.arboristOptions });
+  const tree = await arb.loadActual();
+  return nodeToTree(tree, Infinity);
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+function summarize(arb, specs) {
+  const result = { added: [] };
+  for (const spec of specs) {
+    // Handle scoped packages: @scope/name@version → @scope/name
+    const name = spec.replace(/@[^@/]*$/, "");
+    const node = arb.idealTree?.children?.get(name);
+    result.added.push({
+      name: node?.name || name,
+      version: node?.version || "",
+      resolved: node?.resolved || "",
+      integrity: node?.integrity || "",
+    });
+  }
+  return result;
+}
+
+function nodeToTree(node, depth, seen = new Set()) {
+  if (!node || depth < 0) return null;
+  if (seen.has(node.path)) {
+    return { name: node.name, version: node.version, circular: true };
+  }
+  seen.add(node.path);
+
+  const children = [];
+  if (node.children && depth > 0) {
+    for (const [, child] of node.children) {
+      const c = nodeToTree(child, depth - 1, seen);
+      if (c) children.push(c);
+    }
+  }
+
+  return {
+    name: node.name || "",
+    version: node.version || "",
+    resolved: node.resolved || "",
+    path: node.path || "",
+    dev: node.dev || false,
+    optional: node.optional || false,
+    peer: node.peer || false,
+    children,
+  };
 }
 
 // ── AMQL Resolver ───────────────────────────────────────────────────
+// Scans package.json files and emits Dependency, Workspace, Script
+// annotations for structural querying.
 
 declare({
   name: "npm",
   version: 1,
-  filePatterns: ["package.json"],
+  filePatterns: ["**/package.json"],
 
-  setup({ on, log, meta }) {
+  setup({ on, log }) {
     on("*", (ctx) => {
-      // Parse the package.json
       let pkg;
       try {
         pkg = JSON.parse(ctx.source);
       } catch (e) {
-        log.error(`Failed to parse package.json: ${e.message}`);
+        log.warn(`Failed to parse ${ctx.file}: ${e.message}`);
         return [];
       }
 
+      // Skip node_modules
+      if (ctx.file.includes("node_modules")) return [];
+
       const nodes = [];
 
-      // Emit Dependency annotations for each dependency
-      const depSections = [
+      // Dependencies
+      for (const [section, type] of [
         ["dependencies", "prod"],
         ["devDependencies", "dev"],
         ["optionalDependencies", "optional"],
         ["peerDependencies", "peer"],
-      ];
-
-      for (const [section, type] of depSections) {
+      ]) {
         const deps = pkg[section];
         if (!deps) continue;
-
         for (const [name, version] of Object.entries(deps)) {
           const source = version.startsWith("file:")
             ? "file"
-            : version.startsWith("git")
+            : version.startsWith("git") || version.includes("github:")
               ? "git"
               : version.startsWith("workspace:")
                 ? "workspace"
                 : "registry";
-
-          nodes.push(
-            Dependency({
-              name,
-              version: String(version),
-              type,
-              source,
-            }),
-          );
+          nodes.push(Dependency({ name, version: String(version), type, source }));
         }
       }
 
-      // Emit Workspace annotations
-      const workspaces = pkg.workspaces;
-      if (Array.isArray(workspaces)) {
-        for (const pattern of workspaces) {
-          nodes.push(Workspace({ name: pattern, path: pattern }));
-        }
+      // Workspaces (both array and object forms)
+      const workspaces = Array.isArray(pkg.workspaces)
+        ? pkg.workspaces
+        : pkg.workspaces?.packages || [];
+      for (const pattern of workspaces) {
+        nodes.push(Workspace({ name: pattern, path: pattern }));
       }
 
-      // Emit Script annotations
-      const scripts = pkg.scripts;
-      if (scripts && typeof scripts === "object") {
-        for (const [name, command] of Object.entries(scripts)) {
+      // Scripts
+      if (pkg.scripts) {
+        for (const [name, command] of Object.entries(pkg.scripts)) {
           nodes.push(Script({ name, command: String(command) }));
         }
       }

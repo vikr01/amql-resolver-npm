@@ -9,8 +9,7 @@
   "engines": { "node": ">=20" },
   "dependencies": {
     "@amql/resolver": "0.0.0-alpha.0",
-    "@npmcli/arborist": "^8",
-    "@npmcli/config": "^9"
+    "@npmcli/arborist": "^8"
   },
   "peerDependencies": {
     "@amql/resolver": ">=0.0.0-alpha.0"
