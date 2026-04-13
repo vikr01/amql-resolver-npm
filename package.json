@@ -1,0 +1,19 @@
+{
+  "name": "@amql/resolver-npm",
+  "version": "0.0.0-alpha.0",
+  "description": "AMQL resolver for npm package management — programmatic install, update, remove via @npmcli/arborist",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "repository": "https://github.com/unstabler/amql-resolver-npm",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@amql/resolver": "0.0.0-alpha.0",
+    "@npmcli/arborist": "^8",
+    "@npmcli/config": "^9"
+  },
+  "peerDependencies": {
+    "@amql/resolver": ">=0.0.0-alpha.0"
+  },
+  "agents": { "skills": "consumer-skills" }
+}
